@@ -13,8 +13,7 @@ Group code 1 is the reference and code 2 is the comparison. The metadata
 codebook must define their biological meanings and concentration cutoffs.
 
 Genes require at least 10 counts in round(0.9 * sample count) samples.
-DEGs use adjusted P < 0.05. TNF-alpha ORA uses an exploratory gene-selection
-cutoff of adjusted P < 0.6; GO GSEA uses unadjusted P values. Enrichment methods
+DEGs use adjusted P < 0.05. Enrichment methods
 and plotting limits are specified in the functions below.
 
 ```{r setup, include=FALSE}

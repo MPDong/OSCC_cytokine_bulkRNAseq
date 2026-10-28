@@ -1,0 +1,836 @@
+---
+title: "OSCC cytokine study: bulk RNA-seq analysis"
+author: "Minh Phuong Dong"
+output:
+  html_document:
+    toc: true
+---
+
+Differential expression of IL-10 and TNF-alpha groups, batch diagnostics,
+gene-set enrichment, and expression visualization in 103 OSCC tumors.
+Inputs are `gene_counts_103_samples.csv` and `cytokineRNAseq.csv`.
+Group code 1 is the reference and code 2 is the comparison. The metadata
+codebook must define their biological meanings and concentration cutoffs.
+
+Genes require at least 10 counts in round(0.9 * sample count) samples.
+DEGs use adjusted P < 0.05. TNF-alpha ORA uses an exploratory gene-selection
+cutoff of adjusted P < 0.6; GO GSEA uses unadjusted P values. Enrichment methods
+and plotting limits are specified in the functions below.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+```{r packages}
+library(dplyr)
+library(DESeq2)
+library(ggplot2)
+library(tidyverse) # Data wrangling
+library(ComplexHeatmap)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(EnrichmentBrowser)
+library(circlize)
+library(clusterProfiler)
+library(enrichplot)
+library(vegan)
+library(ReactomePA)
+library(fgsea)
+library(msigdbr)
+library(limma)
+library(ggrepel)
+library(grid)
+```
+
+# Load the study counts and combined metadata
+
+```{r inputs}
+# Count matrix: first column is gene_id (Ensembl ID|gene symbol).
+countData_ref <- read.csv("gene_counts_103_samples.csv", check.names = FALSE) %>%
+  tidyr::separate(gene_id, into = c("ensembl", "gene_symbol"), sep = "\\|",
+                  extra = "merge", fill = "right")
+countData <- countData_ref %>%
+  column_to_rownames("ensembl") %>%
+  dplyr::select(-gene_symbol)
+
+# One combined table supplies the clinical covariates and cytokine groups.
+colData_cytokine <- read.csv("cytokineRNAseq.csv", row.names = "sample_id")
+fct_vars <- c("IL10_roc", "TNFa_roc", "batch", "PS")
+colData_cytokine[fct_vars] <- lapply(colData_cytokine[fct_vars], as.factor)
+rm(fct_vars)
+
+# Use the study count-matrix samples, in the same order in both objects.
+# Extra rows from other studies in the metadata are not analyzed.
+stopifnot(all(colnames(countData) %in% rownames(colData_cytokine)))
+colData_cytokine <- colData_cytokine[colnames(countData), , drop = FALSE]
+colData_cytokine$id <- rownames(colData_cytokine)
+countData_cytokine <- countData[, colData_cytokine$id, drop = FALSE]
+stopifnot(identical(colnames(countData_cytokine), rownames(colData_cytokine)))
+
+# Batch 2 versus other batches.
+colData_cytokine$batch2 <- factor(
+  ifelse(as.character(colData_cytokine$batch) == "2", 2L, 1L)
+)
+dir.create("results", showWarnings = FALSE)
+```
+
+# Differential expression function
+
+```{r deg-function}
+# Create function for DEG
+DEG <- function(countData, colData, design, condition, ref, value) {
+  
+  ddsMat <- DESeqDataSetFromMatrix(countData = countData,
+                              colData = colData, 
+                              design = design)
+# filter to keep 10 counts and above in at least 90% of samples
+  ddsMat_Filtered <-
+    rowSums(counts(ddsMat)>=10) >= round(ncol(ddsMat)*0.9)
+
+  dds <- ddsMat[ddsMat_Filtered,]
+
+# Ensure condition is a factor and set reference level
+  dds[[condition]] <- relevel(dds[[condition]], ref = ref)
+
+# Run DESeq
+  deseq <- DESeq(dds, parallel = T)
+  
+  df <- results(deseq) %>%
+    as.data.frame()
+  df$ensembl = rownames(df)
+  
+  df <- df %>%
+  left_join(
+    countData_ref %>% dplyr::select(ensembl, gene_symbol),
+    by = "ensembl"
+  )
+
+#sig difference
+  df_sig <- 
+    df %>% 
+    filter(padj < value)
+  
+# Normalize and transform the data in the `DESeqDataSet` object
+  dds_norm <- vst(dds, blind = TRUE)
+
+    return(list(dds_norm = dds_norm, deseq = deseq, df = df, df_sig = df_sig))
+}
+```
+
+# MSigDB gene sets
+
+```{r msigdb}
+# MSigDB gene sets
+msig_h <- msigdbr(species = "Homo sapiens", category = "H") %>%
+  dplyr::select(gs_name, entrez_gene)
+pathways_h <- split(msig_h$entrez_gene, msig_h$gs_name)
+
+msig_C2 <- msigdbr(species = "Homo sapiens", category = "C2") %>%
+  dplyr::select(gs_name, entrez_gene)
+pathways_C2 <- split(msig_C2$entrez_gene, msig_C2$gs_name)
+
+msig_C5 <- msigdbr(species = "Homo sapiens", category = "C5") %>%
+  dplyr::select(gs_name, entrez_gene)
+pathways_C5 <- split(msig_C5$entrez_gene, msig_C5$gs_name)
+
+msig_C6 <- msigdbr(species = "Homo sapiens", category = "C6") %>%
+  dplyr::select(gs_name, entrez_gene)
+pathways_C6 <- split(msig_C6$entrez_gene, msig_C6$gs_name)
+
+msig_C7 <- msigdbr(species = "Homo sapiens", category = "C7") %>%
+  dplyr::select(gs_name, entrez_gene)
+pathways_C7 <- split(msig_C7$entrez_gene, msig_C7$gs_name)
+```
+
+# ORA and GSEA function
+
+```{r ora-function}
+#Create function for GO and KEGG
+ORA <- function(DEG, p, log2FC) {
+# Prepare df with ENTREZID for ORA 
+deseq <- EnrichmentBrowser::idMap(DEG$deseq, org = "hsa", from = "ENSEMBL", to = "ENTREZID")
+
+# Add ENTREZID as a column (rownames are ENTREZIDs after idMap)
+df <- results(deseq) %>% as.data.frame()
+df$entrezid = rownames(df)
+
+# Filter significant DEGs 
+df_sig <- 
+  df %>% 
+  filter(padj < p & (log2FoldChange >  log2FC | log2FoldChange < -log2FC))
+
+df_sig_up <- 
+  df %>% 
+  filter(padj < p & log2FoldChange > log2FC)
+
+df_sig_down <- 
+  df %>% 
+  filter(padj < p & log2FoldChange < -log2FC)
+
+# ORA
+## ORA GO enrichment analysis
+
+GO <- enrichGO(gene = df_sig$entrezid,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                pvalueCutoff = 0.05, 
+                qvalueCutoff = 0.2,
+                ont = "ALL", readable = T)
+
+GOup <- enrichGO(gene = df_sig_up$entrezid,
+                OrgDb = org.Hs.eg.db,
+                keyType = "ENTREZID",
+                pvalueCutoff = 0.05, 
+                qvalueCutoff = 0.2,
+                ont = "ALL", readable = T)
+
+GOdown <- enrichGO(gene = df_sig_down$entrezid,
+                OrgDb = org.Hs.eg.db,
+                 keyType = "ENTREZID",
+                pvalueCutoff = 0.05, 
+                qvalueCutoff = 0.2,
+                ont = "ALL", readable = T)
+
+## ORA KEGG enrichment analysis
+KEGG <- enrichKEGG(gene = df_sig$entrezid, 
+                    organism = "hsa",
+                    keyType = "kegg",
+                    pvalueCutoff = 0.05, 
+                    qvalueCutoff = 0.2)
+
+KEGGup <- enrichKEGG(gene = df_sig_up$entrezid, 
+                    organism = "hsa",
+                    keyType = "kegg",
+                    pvalueCutoff = 0.05, 
+                    qvalueCutoff = 0.2)
+
+KEGGdown <- enrichKEGG(gene = df_sig_down$entrezid, 
+                    organism = "hsa",
+                    keyType = "kegg",
+                    pvalueCutoff = 0.05, 
+                    qvalueCutoff = 0.2)
+
+## ORA reactome enrichment analysis
+reactome <- enrichPathway(gene=df_sig$entrezid,
+                          pvalueCutoff = 0.05, 
+                          readable=TRUE)
+
+reactomeup <- enrichPathway(gene=df_sig_up$entrezid,
+                          pvalueCutoff = 0.05, 
+                          readable=TRUE)
+
+reactomedown <- enrichPathway(gene=df_sig_down$entrezid,
+                          pvalueCutoff = 0.05, 
+                          readable=TRUE)
+
+ #GSEA
+
+##prepare the gene list
+gene_list <- df$log2FoldChange
+##name the vector
+names(gene_list) <-df$entrezid
+
+##omit the NA values
+gene_list <- na.omit(gene_list)
+
+##sort the list in decreasing order
+gene_list = sort(gene_list, decreasing =TRUE)
+
+gene_list_up <- gene_list[gene_list >  log2FC]
+
+gene_list_down <- gene_list[gene_list < -log2FC]
+
+##GSEA in Clusterprofiles
+GSEA <- gseGO(geneList = gene_list,
+      ont ="ALL",
+      minGSSize = 15, 
+      maxGSSize = 1000, 
+      pvalueCutoff = 0.05,
+      nPermSimple = 100000,
+      verbose = TRUE, 
+      OrgDb = org.Hs.eg.db, 
+      pAdjustMethod = "none")
+
+##MSig DB
+fgh <- fgsea(pathways = pathways_h, 
+             stats = gene_list, 
+             minSize = 15, 
+             maxSize = 1000, 
+             eps = 0.0)
+
+fghup <- fgsea(pathways = pathways_h, 
+               stats = gene_list_up, 
+               minSize = 15, 
+               maxSize = 1000, 
+               eps = 0.0, 
+               scoreType = "pos")
+
+fghdown <- fgsea(pathways = pathways_h, 
+                 stats = gene_list_down, 
+                 minSize = 15, 
+                 maxSize = 1000, 
+                 eps = 0.0, 
+                 scoreType = "neg")
+
+fgC2 <- fgsea(pathways = pathways_C2, 
+              stats = gene_list, 
+              minSize = 15, 
+              maxSize = 1000, eps = 0.0)
+
+fgC2up <- fgsea(pathways = pathways_C2, 
+                stats = gene_list_up, 
+                minSize = 15, 
+                maxSize = 1000, eps = 0.0, scoreType = "pos")
+
+fgC2down <- fgsea(pathways = pathways_C2, 
+                  stats = gene_list_down, 
+                  minSize = 15, 
+                  maxSize = 1000, 
+                  eps = 0.0, scoreType = "neg")
+
+fgC5 <- fgsea(pathways = pathways_C5, 
+              stats = gene_list, 
+              minSize = 15, 
+              maxSize = 1000, eps = 0.0)
+
+fgC5up <- fgsea(pathways = pathways_C5, 
+                stats = gene_list_up, 
+                minSize = 15, 
+                maxSize = 1000, eps = 0.0, scoreType = "pos")
+
+fgC5down <- fgsea(pathways = pathways_C5, 
+                  stats = gene_list_down, 
+                  minSize = 15, 
+                  maxSize = 1000, 
+                  eps = 0.0, scoreType = "neg")
+
+fgC6 <- fgsea(pathways = pathways_C6, 
+              stats = gene_list, 
+              minSize = 15, 
+              maxSize = 1000, eps = 0.0)
+
+fgC6up <- fgsea(pathways = pathways_C6, 
+                stats = gene_list_up, 
+                minSize = 15, 
+                maxSize = 1000, eps = 0.0, scoreType = "pos")
+
+fgC6down <- fgsea(pathways = pathways_C6, 
+                  stats = gene_list_down, 
+                  minSize = 15, 
+                  maxSize = 1000, eps = 0.0, scoreType = "neg")
+
+fgC7 <- fgsea(pathways = pathways_C7, 
+              stats = gene_list, 
+              minSize = 15, maxSize = 1000, eps = 0.0)
+
+fgC7up <- fgsea(pathways = pathways_C7, 
+                stats = gene_list_up, 
+                minSize = 15, 
+                maxSize = 1000, eps = 0.0, scoreType = "pos")
+
+fgC7down <- fgsea(pathways = pathways_C7, 
+                  stats = gene_list_down, 
+                  minSize = 15, 
+                  maxSize = 1000, eps = 0.0, scoreType = "neg")
+ return(list(df_sig = df_sig, 
+             df_sig_up = df_sig_up, 
+             df_sig_down = df_sig_down, 
+             GO = GO, 
+             GOup = GOup, 
+             GOdown = GOdown, 
+             KEGG = KEGG, 
+             KEGGup = KEGGup, 
+             KEGGdown = KEGGdown, 
+             reactome = reactome, 
+             reactomeup = reactomeup, 
+             reactomedown = reactomedown,
+             gene_list = gene_list,
+             GSEA = GSEA,
+             fgh = fgh,
+             fghup = fghup,
+             fghdown = fghdown,
+             fgC2 = fgC2,
+             fgC2up = fgC2up,
+             fgC2down = fgC2down,
+             fgC5 = fgC5,
+             fgC5up = fgC5up,
+             fgC5down = fgC5down,
+             fgC6 = fgC6,
+             fgC6up = fgC6up,
+             fgC6down = fgC6down,
+             fgC7 = fgC7,
+             fgC7up = fgC7up,
+             fgC7down = fgC7down
+             ))
+}
+```
+
+# Volcano function
+
+```{r volcano-function}
+# Volcano plot
+volcano <- function (DEG, plottitle, p = 0.05) {
+# Add status
+ df <- DEG$df %>%
+    mutate(Labels = case_when(
+      log2FoldChange >= 0 & padj <= p ~ "Up-regulated",
+      log2FoldChange < 0 & padj <= p ~ "Down-regulated",
+      TRUE ~ "Not significant"))
+
+# Define plot aesthetics
+  cols <- c("Up-regulated" = "red", "Down-regulated" = "blue", "Not significant" = "grey") 
+  sizes <- c("Up-regulated" = 1, "Down-regulated" = 1, "Not significant" = 0.5) 
+  alphas <- c("Up-regulated" = 0, "Down-regulated" = 0, "Not significant" = 0)
+
+  # Generate plot
+plot <- ggplot(df, aes(
+      x = log2FoldChange,
+      y = -log10(padj),
+      fill = Labels
+    )) +
+    ggrepel::geom_label_repel(data = subset(df, padj < p),
+                              aes(label = gene_symbol),
+                              size = 1.5,
+                              box.padding=0, fill = NA, label.size = NA, point.padding=1, segment.color="black", show.legend=FALSE, max.overlaps = 20
+  ) +
+    geom_point(shape = 21, colour = "black") + 
+    geom_hline(yintercept = -log10(p), linetype = "dashed") + 
+    geom_vline(xintercept = c(-5, 5), linetype = "dashed") +
+    scale_fill_manual(values = cols) + 
+    scale_size_manual(values = sizes) + 
+    scale_alpha_manual(values = alphas) + 
+    scale_x_continuous(breaks = seq(-3, 3, 1.5), limits = c(-3, 3)) +
+    scale_y_continuous(breaks = seq(0, 4, 2), limits = c(0, 4)) +
+    theme_bw() +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(
+    title = plottitle,
+    x = "Log2 Fold Change",
+    y = "-Log10 Adjusted P-value") +
+  theme(
+    plot.title = element_text(size = 10, hjust = 0.5),  # Customize title font size and center alignment
+    axis.title.x = element_text(size = 8),            # Customize x-axis label font size
+    axis.title.y = element_text(size = 8),            # Customize y-axis label font size
+    legend.text = element_text(size = 6),             # Customize legend text size
+    legend.title = element_text(size = 8),             # Customize legend title size
+    legend.position = "right"
+  )
+ return(plot)
+}
+```
+
+# IL-10: unadjusted model
+
+```{r il10-1}
+#DEG
+IL10 <- DEG(countData = countData_cytokine,
+            colData = colData_cytokine, 
+            design = ~ IL10_roc, 
+            condition = "IL10_roc",
+            ref = "1",
+            value = 0.05)
+```
+
+```{r il10-2}
+# Extract variance-stabilized data
+expr <- assay(IL10$dds_norm)
+
+# Compute distance matrix (Euclidean or others)
+d <- dist(t(expr))  # transpose: samples are rows
+
+# Prepare metadata
+meta <- as.data.frame(colData(IL10$dds_norm))
+
+# Run PERMANOVA / adonis test
+adonis2(d ~ batch2 + IL10_roc, data = meta, permutations = 999)
+```
+
+```{r il10-3}
+#extract the expression matrix
+norm_mat <- assay(IL10$dds_norm)
+# Run PCA with x = PCA scores (PC1, PC2, …) for each sample
+norm_mat_pca_res <- prcomp(t(norm_mat))
+# Convert PCA scores to a tibble with sample IDs
+norm_mat_pca_df <- norm_mat_pca_res$x %>%
+    as_tibble(rownames = "sampleid")
+# Add sample metadata to the PCA table
+norm_mat_pca_w_meta_df <- inner_join(
+  norm_mat_pca_df,
+  meta %>% as_tibble(rownames = "sampleid"),
+  by = "sampleid"
+) %>%
+  mutate(
+    batch = factor(batch)
+  )
+# clean up space
+rm(norm_mat, norm_mat_pca_df, norm_mat_pca_res)
+# Statistical test between batch and PCs
+kruskal.test(
+  PC2 ~ batch,
+  data = norm_mat_pca_w_meta_df
+)
+
+pairwise.wilcox.test(norm_mat_pca_w_meta_df$PC2, norm_mat_pca_w_meta_df$batch2, p.adjust.method = "bonferroni")
+```
+
+```{r il10-4}
+# Age diagnostic, when age is available.
+if ("ages" %in% names(norm_mat_pca_w_meta_df)) {
+  # Correlation between age and each PC
+  cor_test_res <- cor.test(norm_mat_pca_w_meta_df$PC1, norm_mat_pca_w_meta_df$ages, method = "spearman")
+  cor_test_res$p.value
+}
+```
+
+```{r il10-5}
+png("results/batch_raw.png", units="in", width=3.5, height=2.5, res=300)
+# PCA plot
+print(norm_mat_pca_w_meta_df %>%
+    ggplot(
+      aes(
+        x = PC1,
+        y = PC2,
+        color = batch
+      )
+    ) +
+      ggtitle("PCA plot") +
+      geom_point(size = 0.5) +
+      stat_ellipse() +
+      theme(axis.text.x=element_text(size=7),
+            axis.text.y=element_text(size=6),
+            plot.title = element_text(size=8),
+            legend.text = element_text(size=6),
+            legend.title =element_text(size=6),
+            axis.title.x = element_text(size=7),
+            axis.title.y = element_text(size=7)
+    )
+)
+dev.off()
+```
+
+```{r il10-6}
+plotPCA(
+  IL10$dds_norm,
+  intgroup = "batch",
+  returnData= F,
+  pcsToUse = 1:3
+)
+```
+
+# IL-10: batch-adjusted model
+
+```{r il10-7}
+#DEG
+IL10_1 <- DEG(countData = countData_cytokine,
+            colData = colData_cytokine, 
+            design = ~ batch2 + IL10_roc, 
+            condition = "IL10_roc",
+            ref = "1",
+            value = 0.05)
+```
+
+```{r il10-8}
+# Extract variance-stabilized data
+vsd <- assay(IL10_1$dds_norm)
+ 
+# 
+expr <-  limma::removeBatchEffect(vsd, IL10_1$dds_norm$batch2)
+
+# Compute distance matrix (Euclidean or others)
+d <- dist(t(expr))  # transpose: samples are rows
+
+# Prepare metadata
+meta <- as.data.frame(colData(IL10_1$deseq))
+
+# Run PERMANOVA / adonis test
+adonis2(d ~ batch + IL10_roc, data = meta, permutations = 999)
+```
+
+```{r il10-9}
+#extract the expression matrix
+norm_mat <- expr
+# Run PCA with x = PCA scores (PC1, PC2, …) for each sample
+norm_mat_pca_res <- prcomp(t(norm_mat))
+# Convert PCA scores to a tibble with sample IDs
+norm_mat_pca_df <- norm_mat_pca_res$x %>%
+    as_tibble(rownames = "sampleid")
+# Add sample metadata to the PCA table
+norm_mat_pca_w_meta_df <- inner_join(
+  norm_mat_pca_df,
+  meta %>% as_tibble(rownames = "sampleid"),
+  by = "sampleid"
+) %>%
+  mutate(
+    batch = factor(batch)
+  )
+# clean up space
+rm(norm_mat, norm_mat_pca_df, norm_mat_pca_res)
+# Statistical test between batch and PCs
+kruskal.test(
+  PC2 ~ batch,
+  data = norm_mat_pca_w_meta_df
+)
+
+pairwise.wilcox.test(norm_mat_pca_w_meta_df$PC4, norm_mat_pca_w_meta_df$batch, p.adjust.method = "bonferroni")
+```
+
+```{r il10-10}
+png("results/batch_removed.png", units="in", width=3.5, height=2.5, res=300)
+# PCA plot
+print(norm_mat_pca_w_meta_df %>%
+    ggplot(
+      aes(
+        x = PC1,
+        y = PC2,
+        color = batch
+      )
+    ) +
+      ggtitle("PCA plot") +
+      geom_point(size = 0.5) +
+      stat_ellipse() +
+      theme(axis.text.x=element_text(size=7),
+            axis.text.y=element_text(size=6),
+            plot.title = element_text(size=8),
+            legend.text = element_text(size=6),
+            legend.title =element_text(size=6),
+            axis.title.x = element_text(size=7),
+            axis.title.y = element_text(size=7)
+    )
+)
+dev.off()
+```
+
+```{r il10-11}
+ORA_IL10_1 <- ORA(IL10_1, 0.05, log2FC = 0)
+```
+
+```{r il10-12}
+png("results/GO_IL10_batch.png", units="in", width=3.5, height=4, res=300)
+# Dotplot for GO
+options(enrichplot.colours = c("red","blue"))
+print(dotplot(ORA_IL10_1$GO, showCategory=25) + 
+  ggtitle("IL10 - Dot plot for ORA GO pathway") + 
+  theme(axis.text.x=element_text(size=7),
+        axis.text.y=element_text(size=6),
+        plot.title = element_text(size=8),
+        legend.text = element_text(size=6),
+        legend.title =element_text(size=6),
+        axis.title.x = element_text(size=7),
+        legend.key.size = unit(0.1, "in"),
+        legend.key.width = unit(0.1,"in")) +
+  scale_size_continuous(range = c(1, 4))
+)
+dev.off()
+```
+
+```{r il10-13}
+png("results/Volplot_IL10_batch.png", units="in", width=3.5, height=3, res=300)
+print(volcano(IL10_1, "Volcano Plot - IL10")
+)
+dev.off()
+```
+
+# IL-10: batch- and stage-adjusted model
+
+```{r il10-14}
+#DEG
+IL10_2 <- DEG(countData = countData_cytokine,
+            colData = colData_cytokine, 
+            design = ~ batch2+ PS + IL10_roc, 
+            condition = "IL10_roc",
+            ref = "1",
+            value = 0.05)
+```
+
+```{r il10-15}
+normalized_counts <- counts(IL10_2$deseq, normalized = TRUE)
+norm_count <- as.data.frame(normalized_counts)
+norm_count$ensembl <- rownames(norm_count)
+```
+
+```{r il10-16}
+# Filter significant DEGs and prepare matrix
+res_df_sig <- 
+  IL10_2$df_sig %>% 
+  filter(padj < 0.05) %>% 
+  inner_join(norm_count, by = c("ensembl" = "ensembl"))
+```
+
+```{r il10-17}
+# Select expression columns by sample IDs instead of fixed positions.
+rownames(res_df_sig) <- res_df_sig$ensembl
+res_df_sig <- as.matrix(res_df_sig[, colData_cytokine$id, drop = FALSE])
+```
+
+```{r il10-18}
+# Add a bar on top of the heatmap to identify the conditions or groups of samples
+column_ha <- 
+  HeatmapAnnotation(Condition = as.factor(colData_cytokine$IL10_roc),
+                    
+                    # Select color per each condition
+                    col = list(Condition = c("1" = "orchid3", 
+                                             "2" = "aquamarine")), 
+                    
+                    # color of the border
+                    gp = gpar(col = "gray70"),
+                    
+                    # Show or hide the annotation name
+                    show_annotation_name = FALSE,
+                    
+                    # Orientation of the annotation
+                    annotation_legend_param = list(
+                      Condition = list(direction = "vertical", 
+                                       title_position = "topcenter", 
+                                       legend_gp = gpar(fontsize = 6),
+                                       nrow = 1)))
+col_fun <- colorRamp2(c(-2,0,2), c("navy", "white","red"))
+col_fun(seq(-2,2))
+```
+
+```{r il10-19}
+# scale the normalized gene counts
+hmap_bt <- t(scale(t(res_df_sig)))
+```
+
+```{r il10-20}
+png("results/hmap_IL10_batch_PS.png", units="in", width=5, height=7, res=300)
+# Create heatmap object
+draw(Heatmap(
+  hmap_bt, 
+  border = 1,
+  #rect_gp = gpar(col = "gray60", lwd = 1),
+  name = "Z-score",
+  show_row_names = F, show_column_names = F, 
+  # split to easily view the separation
+  split = 2, column_split = as.factor(colData_cytokine$IL10_roc), 
+  row_title = " ", 
+  column_title = "Heatmap of Significantly Different Genes",
+  column_title_gp = grid::gpar(fontsize = 9, fontface = "bold"),
+  show_heatmap_legend = TRUE,
+  top_annotation = column_ha,
+  heatmap_legend_param = list(
+      title_gp  = grid::gpar(fontsize = 6, fontface = "bold"),
+      labels_gp = gpar(fontsize = 6),
+      legend_direction = "vertical", 
+      legend_width = unit(1, "cm"), 
+      legend_length = unit(1, "cm"), 
+      row_names_gp = gpar(fontsize = 6),
+      column_names_gp = gpar(fontsize = 6)),
+  cluster_columns = cluster_within_group(hmap_bt, as.factor(colData_cytokine$IL10_roc)),
+  show_column_dend = FALSE,
+  show_row_dend = TRUE,
+  col = col_fun
+))
+dev.off()
+```
+
+```{r il10-21}
+ORA_IL10_2 <- ORA(IL10_2, 0.05, 0)
+```
+
+```{r il10-22}
+png("results/GO_IL10_batch_PS.png", units="in", width=3.5, height=5, res=300)
+# Dotplot for GO
+options(enrichplot.colours = c("red","blue"))
+print(dotplot(ORA_IL10_2$GO, showCategory=25) + 
+  ggtitle("IL10 - Dot plot for ORA GO pathway") + 
+  theme(axis.text.x=element_text(size=7),
+        axis.text.y=element_text(size=6),
+        plot.title = element_text(size=8),
+        legend.text = element_text(size=6),
+        legend.title =element_text(size=6),
+        axis.title.x = element_text(size=7),
+        legend.key.size = unit(0.1, "in"),
+        legend.key.width = unit(0.1,"in")) +
+  scale_size_continuous(range = c(1, 4))
+)
+dev.off()
+```
+
+```{r il10-23}
+png("results/Reactome_IL10_batch_PS.png", units="in", width=3.5, height=4, res=300)
+# Dotplot for GO
+options(enrichplot.colours = c("red","blue"))
+print(dotplot(ORA_IL10_2$reactome, showCategory=25) + 
+  ggtitle("IL10 - Dot plot for ORA GO pathway") + 
+  theme(axis.text.x=element_text(size=7),
+        axis.text.y=element_text(size=6),
+        plot.title = element_text(size=8),
+        legend.text = element_text(size=6),
+        legend.title =element_text(size=6),
+        axis.title.x = element_text(size=7),
+        legend.key.size = unit(0.1, "in"),
+        legend.key.width = unit(0.1,"in")) +
+  scale_size_continuous(range = c(1, 4))
+)
+dev.off()
+```
+
+# TNF-alpha analysis
+
+```{r tnfa-1}
+#DEG
+TNFa <- DEG(countData = countData_cytokine,
+            colData = colData_cytokine, 
+            design = ~ TNFa_roc, 
+            condition = "TNFa_roc",
+            ref = "1",
+            value = 0.05)
+```
+
+```{r tnfa-2}
+# Extract variance-stabilized data
+expr <- assay(TNFa$dds_norm)
+
+# Compute distance matrix (Euclidean or others)
+d <- dist(t(expr))  # transpose: samples are rows
+
+# Prepare metadata
+meta <- as.data.frame(colData(TNFa$dds_norm))
+
+# Run PERMANOVA / adonis test
+adonis2(d ~ batch2 + TNFa_roc, data = meta, permutations = 999)
+```
+
+```{r tnfa-3}
+#DEG
+TNFa_2 <- DEG(countData = countData_cytokine,
+            colData = colData_cytokine, 
+            design = ~ batch2 + PS + TNFa_roc, 
+            condition = "TNFa_roc",
+            ref = "1",
+            value = 0.05)
+```
+
+```{r tnfa-4}
+png("results/Volplot_TNFs_batch_PS.png", units="in", width=3.5, height=3, res=300)
+print(volcano(TNFa_2, "Volcano Plot - TNF-α")
+)
+dev.off()
+```
+
+```{r tnfa-5}
+# Exploratory ORA: gene-selection adjusted P < 0.6.
+ORA_TNFa_2 <- ORA(TNFa_2, 0.6, 0)
+```
+
+```{r tnfa-7}
+png("results/GO_TNFA_batch_PS.png", units="in", width=3.5, height=4.5, res=300)
+# Dotplot for GO
+options(enrichplot.colours = c("red","blue"))
+print(dotplot(ORA_TNFa_2$GO, showCategory=25) + 
+  ggtitle("TNFA - Dot plot for ORA GO pathway") + 
+  theme(axis.text.x=element_text(size=7),
+        axis.text.y=element_text(size=6),
+        plot.title = element_text(size=8),
+        legend.text = element_text(size=6),
+        legend.title =element_text(size=6),
+        axis.title.x = element_text(size=7),
+        legend.key.size = unit(0.1, "in"),
+        legend.key.width = unit(0.1,"in")) +
+  scale_size_continuous(range = c(1, 4))
+)
+dev.off()
+```

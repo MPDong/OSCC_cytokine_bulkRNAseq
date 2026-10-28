@@ -1,0 +1,78 @@
+---
+title: "OSCC cytokine study: TPM export for CIBERSORTx"
+output: html_document
+---
+
+Construct a gene-symbol TPM matrix for the 103 study samples from StringTie
+gene-abundance tables. The expression filter matches the differential
+expression analysis. Output includes the combined matrix and separate matrices
+for IL-10 group codes 1 and 2. Deconvolution is performed externally.
+
+The input directory must contain one `<sample_id>_gene_abund.tab` per sample
+with `Gene.ID` and `TPM` columns after R's column-name conversion.
+Missing genes and duplicate symbols are not automatically imputed or aggregated.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+library(tidyverse)
+```
+
+```{r inputs}
+tpm_dir <- "mapped" # edit to your existing abundance folder
+countData_ref <- read.csv("gene_counts_103_samples.csv", check.names = FALSE) %>%
+  separate(gene_id, c("ensembl", "gene_symbol"), sep = "\\|",
+           extra = "merge", fill = "right")
+countData <- countData_ref %>% column_to_rownames("ensembl") %>%
+  dplyr::select(-gene_symbol)
+colData_cytokine <- read.csv("cytokineRNAseq.csv", row.names = "sample_id")
+stopifnot(all(colnames(countData) %in% rownames(colData_cytokine)))
+colData_cytokine <- colData_cytokine[colnames(countData), , drop = FALSE]
+colData_cytokine$id <- rownames(colData_cytokine)
+gene_ID <- rownames(countData)[rowSums(countData >= 10) >= round(ncol(countData)*0.9)]
+files <- list.files(tpm_dir, pattern = "_gene_abund\\.tab$",
+                    full.names = TRUE, recursive = TRUE)
+sample_names <- sub("_gene_abund\\.tab$", "", basename(files))
+stopifnot(!anyDuplicated(sample_names),
+          all(colData_cytokine$id %in% sample_names))
+files <- files[match(colData_cytokine$id, sample_names)]
+sample_names <- colData_cytokine$id
+dir.create("results/TPM", recursive = TRUE, showWarnings = FALSE)
+```
+
+```{r tpm-matrix}
+tpm_mat <- matrix(NA_real_, nrow = length(gene_ID), ncol = length(files),
+                  dimnames = list(gene_ID, sample_names))
+for (i in seq_along(files)) {
+  x <- read.table(files[i], header = TRUE, sep = "\t",
+                   stringsAsFactors = FALSE, quote = "")
+  idx <- match(gene_ID, x$Gene.ID)
+  tpm_mat[, i] <- x$TPM[idx]
+}
+# Missing gene values and duplicated symbols are reported without imputation
+# or aggregation.
+if (anyNA(tpm_mat)) warning("Missing gene/TPM matches; resolve before uploading.")
+tpm_103 <- as.data.frame(tpm_mat)
+tpm_103$ensembl <- rownames(tpm_103)
+tpm_103 <- tpm_103 %>%
+  left_join(countData_ref %>% dplyr::select(ensembl, gene_symbol), by = "ensembl") %>%
+  relocate(ensembl, gene_symbol, .before = 1) %>% dplyr::select(-ensembl)
+if (anyNA(tpm_103$gene_symbol) || anyDuplicated(tpm_103$gene_symbol)) {
+  warning("Missing or duplicated gene symbols in the deconvolution input.")
+}
+write.table(tpm_103, "results/TPM/TPM_matrix_for_CIBERSORT_103samples.txt",
+             sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+```{r il10-group-exports}
+s1 <- colData_cytokine %>% filter(IL10_roc == 1) %>% pull(id)
+s2 <- colData_cytokine %>% filter(IL10_roc == 2) %>% pull(id)
+expr_1 <- tpm_103 %>% dplyr::select(gene_symbol, all_of(s1))
+expr_2 <- tpm_103 %>% dplyr::select(gene_symbol, all_of(s2))
+write.table(expr_1, "results/TPM/IL10_group1.txt", sep = "\t",
+             quote = FALSE, row.names = FALSE)
+write.table(expr_2, "results/TPM/IL10_group2.txt", sep = "\t",
+             quote = FALSE, row.names = FALSE)
+```
